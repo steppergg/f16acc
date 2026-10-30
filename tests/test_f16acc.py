@@ -88,6 +88,12 @@ class Patch(unittest.TestCase):
         w = torch.randn(384, 500, device="cuda").half()
         self.assertTrue(torch.isfinite(f16acc.mm(x, w)).all())
 
+    def test_zero_width_layer_does_not_crash(self):
+        lin = torch.nn.Linear(0, 16).cuda().half()
+        with torch.no_grad():
+            y = lin(torch.empty(256, 0, device="cuda").half())
+        self.assertEqual(y.shape, (256, 16))
+
     def test_disable_restores_original(self):
         f16acc.disable()
         self.assertIs(torch.nn.functional.linear, patch._orig)

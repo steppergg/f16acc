@@ -9,6 +9,8 @@ f16acc.disable()
 y = f16acc.mm(a, b)    # or call the GEMM directly (fp16 in, fp16 or fp32 out)
 ```
 
+Load the model in FP16 (`.half()` or `dtype=torch.float16`). Under `torch.autocast`, `nn.Linear` receives FP32 tensors, so every call stays on cuBLAS. `f16acc.calls` shows how many calls were routed.
+
 ## Why it works
 
 GeForce cards run FP16 tensor math at **half rate when accumulating in FP32**, which is what cuBLAS and PyTorch use. **With FP16 accumulation they run at full rate**, but long FP16 sums lose accuracy and overflow above 65504.
@@ -19,15 +21,18 @@ If a chunk overflows, the tile is redone with FP32 accumulation by a second, nea
 
 ## Results (stock RTX 4060 Ti 8 GB, Windows 11, torch 2.11 + cu128, triton-windows 3.9)
 
+One run of `bench/gemm_bench.py`. Numbers move about ±5% between runs as the card heats up.
+
 | GEMM 4096³ | TFLOPS | max rel. error vs FP64 |
 |---|---|---|
-| cuBLAS, FP32 accumulate (PyTorch default) | 46.7 | 3.6e-4 |
-| **f16acc** | **65.0** | **4.8e-4** |
-| cuBLAS, FP16 accumulate (`allow_fp16_accumulation`) | 77.9 | 8.8e-3 |
+| cuBLAS, FP32 accumulate (PyTorch default) | 43.2 | 3.7e-4 |
+| **f16acc** | **65.7** | **5.1e-4** |
+| cuBLAS, FP16 accumulate (`allow_fp16_accumulation`) | 77.8 | 8.5e-3 |
 
-- **Raw tensor rate** (`bench/rate.py`): `mma.sync` with FP32 accumulate reaches 0.50 of full rate, with FP16 accumulate 0.99.
+- **Raw tensor rate** (`bench/rate.py`): `mma.sync` reaches 0.47–0.50 of full rate with FP32 accumulate and 0.94–0.99 with FP16 accumulate.
+  - `bench/chunkrate.py` shows the cost of converting each 32-long chunk to FP32: a ceiling of about 0.77–0.80.
+- **Per layer shape** (`bench/shapes.py`, Qwen2.5-1.5B layers, 2048 tokens): 1.18–1.48× faster than cuBLAS. The narrow 256-wide k/v projection gains least.
 - **Qwen2.5-1.5B FP16, 2048-token prompt processing** (`bench/llm.py`): 1.22–1.24× faster. Perplexity 2.1179 → 2.1175, and 99.9% of top-1 predictions match.
-- **Per layer shape** (`bench/shapes.py`): 1.2–1.5× faster than cuBLAS.
 - **Token-by-token generation:** no change. It's limited by memory bandwidth, and inputs under 128 rows stay on cuBLAS.
 
 On a card whose FP32-accumulate rate has been unlocked, plain cuBLAS is faster; use f16acc on stock cards.
@@ -37,9 +42,10 @@ On a card whose FP32-accumulate rate has been unlocked, plain cuBLAS is faster; 
 ## Limits
 
 - Inference only: `enable()` skips anything that needs gradients.
-- FP16 only, not BF16.
+- FP16 only: no BF16, and no autocast (see above).
 - Measured on one Ada card. Ampere should behave the same (the same half-rate rule) but is untested.
 - First use of each layer shape autotunes for a few seconds.
+- Call it from one thread. The overflow pass reads Triton's last-chosen config.
 
 ## Prior work
 
@@ -49,12 +55,13 @@ On a card whose FP32-accumulate rate has been unlocked, plain cuBLAS is faster; 
 
 f16acc is a PyTorch/Triton take on it: a drop-in for `nn.Linear`, measured on a real LLM.
 
-## Tests
+## Tests and benches
 
 ```
 python -m unittest discover -s tests -t .
+python bench/gemm_bench.py      # also: rate.py, chunkrate.py, shapes.py, llm.py (needs transformers)
 ```
 
-The tests cover odd sizes, transposed weights, accuracy against FP64 and both cuBLAS modes, routing and fallbacks, and a forced FP16 overflow that must come out exact.
+The tests cover odd sizes, transposed weights, accuracy against FP64 and both cuBLAS modes, routing and fallbacks, zero-width layers, and a forced FP16 overflow that must come out exact.
 
-`bench/gemm.py` is the hand-written NVRTC + `mma.sync` version (52 TFLOPS), kept as a reference.
+`rate.py` and `chunkrate.py` compile their loops with the NVRTC that ships inside PyTorch, and load `nvcuda.dll`, so they're Windows-only.

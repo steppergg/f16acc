@@ -1,16 +1,14 @@
-"""Compute ceiling of chunked FP16 accumulate: every `steps` mma k16 steps, the
+"""Compute ceiling of chunked FP16 accumulate: every `steps` mma k16 steps the
 FP16 accumulators are converted to FP32, added to FP32 totals and zeroed.
-steps=2 -> chunk 32, 4 -> 64, 8 -> 128."""
-import sys, warnings; warnings.filterwarnings("ignore")
-sys.path.insert(0, sys.argv[1])
-import torch
-from adakit import mma, bench
+steps=2 is a 32-long chunk (what f16acc uses), 4 is 64, 8 is 128."""
+import warnings; warnings.filterwarnings("ignore")
+import _util
 
 TPL = r"""
 __device__ __forceinline__ void h2f(unsigned v, float& x, float& y) {
     asm("{.reg .f16 l, h; mov.b32 {l, h}, %2; cvt.f32.f16 %0, l; cvt.f32.f16 %1, h;}" : "=f"(x), "=f"(y) : "r"(v));
 }
-extern "C" __global__ void mma_loop(float* out, int iters) {
+extern "C" __global__ void loop(float* out, int iters) {
     unsigned a = 0x3c00u * (threadIdx.x & 1u);
     unsigned c[8][2];
     float t[8][4] = {};
@@ -37,11 +35,9 @@ extern "C" __global__ void mma_loop(float* out, int iters) {
     out[blockIdx.x * blockDim.x + threadIdx.x] = s;
 }
 """
-sms = torch.cuda.get_device_properties(0).multi_processor_count
-base = mma.flops
-for steps in (1, 2, 4, 8):
-    mma.SRC = TPL.replace("STEPS", str(steps))
-    mma.flops = lambda blocks, iters, s=steps: base(blocks, iters) * s  # one iter = `steps` mma per chain
-    t, op = mma.measure(torch)
-    clk, pw, _ = bench.sample_under_load(torch, op)
-    print(f"chunk {16*steps:>3} (steps={steps}): {t:6.1f} TFLOPS at {clk:.0f} MHz {pw} W = {t/(sms*1024*clk*1e6/1e12):.3f}")
+
+if __name__ == "__main__":
+    for steps in (1, 2, 4, 8):
+        t, op = _util.mma_loop(TPL.replace("STEPS", str(steps)), steps * 8 * 4096)
+        clk, pw, _ = _util.sample_under_load(op)
+        print(f"chunk {16 * steps:>3}: {t:6.1f} TFLOPS at {clk:.0f} MHz {pw:.0f} W = {_util.efficiency(t, clk):.3f} of full rate")

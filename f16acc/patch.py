@@ -20,12 +20,12 @@ calls = {"chunked": 0, "original": 0}
 
 
 def linear(x, w, b=None):
-    if not (x.is_cuda and x.dtype == w.dtype == torch.float16 and x.numel() // x.shape[-1] >= MIN_ROWS
-            and not torch.is_grad_enabled()):
+    rows = x.shape[:-1].numel()
+    if not (x.is_cuda and x.dtype == w.dtype == torch.float16 and rows >= MIN_ROWS and not torch.is_grad_enabled()):
         calls["original"] += 1
         return _orig(x, w, b)
-    x2 = x.reshape(-1, x.shape[-1])
-    y = mm(x2 if x2.is_contiguous() else x2.contiguous(), w.t())
+    x2 = x.reshape(rows, x.shape[-1])
+    y = mm(x2, w.t())  # the kernel takes any strides
     if b is not None:
         y += b
     calls["chunked"] += 1
@@ -33,10 +33,8 @@ def linear(x, w, b=None):
 
 
 def enable():
-    F.linear = linear
-    torch.nn.modules.linear.F.linear = linear  # nn.Linear looks it up through this module's F
+    F.linear = linear  # nn.Linear calls F.linear through this same module
 
 
 def disable():
     F.linear = _orig
-    torch.nn.modules.linear.F.linear = _orig
