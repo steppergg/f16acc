@@ -47,6 +47,13 @@ On a card whose FP32-accumulate rate has been unlocked, plain cuBLAS is faster; 
 - First use of each layer shape autotunes for a few seconds.
 - Call it from one thread. The overflow pass reads Triton's last-chosen config.
 
+## Security notes
+
+- **The package** (`f16acc/`) only launches GPU kernels. No network access, no file writes, no subprocesses.
+- **Input checks:** `mm()` checks shapes, dtypes and devices with real errors, not asserts, so `python -O` can't remove them. 64-bit indexing turns on automatically when an offset can pass 2³¹.
+- **The benches** start `nvidia-smi` by full path only, never by bare name. They load `nvcuda.dll` from System32 and NVRTC from PyTorch's own folder.
+- **Dependencies:** on Windows, Triton comes from [`triton-windows`](https://github.com/woct0rdho/triton-windows), a community build that isn't published by OpenAI. Install it from PyPI and review it as you would any compiler toolchain.
+
 ## Prior work
 
 - The same idea in C#/.NET, with per-shape routing against cuBLAS and in-kernel overflow recovery: [ooples/AiDotNet.Tensors#1565](https://github.com/ooples/AiDotNet.Tensors/pull/1565) (merged 2026-10-27), discussed in [#1549](https://github.com/ooples/AiDotNet.Tensors/issues/1549).

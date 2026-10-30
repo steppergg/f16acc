@@ -20,14 +20,18 @@ CONFIGS = [triton.Config({"BM": bm, "BN": bn, "BK": bk, "G": 8}, num_stages=s, n
 
 
 @triton.jit
-def _tile(M, N, BM: tl.constexpr, BN: tl.constexpr, G: tl.constexpr):
+def _tile(M, N, BM: tl.constexpr, BN: tl.constexpr, G: tl.constexpr, I64: tl.constexpr):
     pid = tl.program_id(0)
     npm, npn = tl.cdiv(M, BM), tl.cdiv(N, BN)
     first = (pid // (G * npn)) * G
     gsz = min(npm - first, G)
     pm = first + (pid % (G * npn)) % gsz
     pn = (pid % (G * npn)) // gsz
-    return pid, pm * BM + tl.arange(0, BM), pn * BN + tl.arange(0, BN)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    if I64:  # offsets like row * stride pass 2**31 and would wrap to out-of-bounds writes
+        rm, rn = rm.to(tl.int64), rn.to(tl.int64)
+    return pid, rm, rn
 
 
 @triton.jit
@@ -56,11 +60,12 @@ def _store(c_ptr, acc, rm, rn, M, N, scm, scn):
     tl.store(c, acc.to(c_ptr.dtype.element_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
-@triton.autotune(configs=CONFIGS, key=["N", "K", "CHUNKED"])  # per layer shape; M (tokens) varies per call
+@triton.autotune(configs=CONFIGS, key=["N", "K", "CHUNKED", "I64"])  # per layer shape; M (tokens) varies per call
 @triton.jit
 def _gemm(a_ptr, b_ptr, c_ptr, flag_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
-          CHUNKED: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr):
-    pid, rm, rn = _tile(M, N, BM, BN, G)
+          CHUNKED: tl.constexpr, I64: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+          G: tl.constexpr):
+    pid, rm, rn = _tile(M, N, BM, BN, G, I64)
     acc = _loop(a_ptr, b_ptr, M, N, K, sam, sak, sbk, sbn, rm, rn, CHUNKED, BM, BN, BK)
     if CHUNKED:  # abs(NaN) < inf is false, so NaN is flagged too
         tl.store(flag_ptr + pid, tl.max(tl.where(tl.abs(acc) < float("inf"), 0, 1)).to(tl.int8))
@@ -69,25 +74,32 @@ def _gemm(a_ptr, b_ptr, c_ptr, flag_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
 
 @triton.jit
 def _redo(a_ptr, b_ptr, c_ptr, flag_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
-          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr):
-    pid, rm, rn = _tile(M, N, BM, BN, G)
+          I64: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr):
+    pid, rm, rn = _tile(M, N, BM, BN, G, I64)
     if tl.load(flag_ptr + pid) != 0:
         acc = _loop(a_ptr, b_ptr, M, N, K, sam, sak, sbk, sbn, rm, rn, False, BM, BN, BK)
         _store(c_ptr, acc, rm, rn, M, N, scm, scn)
 
 
 def mm(a, b, out_dtype=torch.float16, chunked=True):
-    assert a.dtype == b.dtype == torch.float16 and a.shape[1] == b.shape[0]
+    # real checks, not asserts (python -O drops those): a bad shape or dtype
+    # would make the kernel read past the end of b
+    if a.dim() != 2 or b.dim() != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError(f"mm needs (M, K) @ (K, N), got {tuple(a.shape)} @ {tuple(b.shape)}")
+    if a.dtype != torch.float16 or b.dtype != torch.float16 or not (a.is_cuda and b.is_cuda) or a.device != b.device:
+        raise ValueError("mm needs fp16 CUDA tensors on the same device")
     M, K = a.shape
     N = b.shape[1]
     c = torch.empty(M, N, device=a.device, dtype=out_dtype)
     # sized for the smallest tile (64 x 64) so any autotuned config fits
     flags = torch.empty(triton.cdiv(M, 64) * triton.cdiv(N, 64), device=a.device, dtype=torch.int8)
     args = (a, b, c, flags, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1))
-    _gemm[lambda m: (triton.cdiv(M, m["BM"]) * triton.cdiv(N, m["BN"]),)](*args, CHUNKED=chunked)
+    # 64-bit indexing only when some element offset can pass 2**31 (it costs ~5% speed)
+    i64 = max((t.shape[0] - 1) * t.stride(0) + (t.shape[1] - 1) * t.stride(1) for t in (a, b, c)) >= 2 ** 31 - 1
+    _gemm[lambda m: (triton.cdiv(M, m["BM"]) * triton.cdiv(N, m["BN"]),)](*args, CHUNKED=chunked, I64=i64)
     if chunked:
         cfg = _gemm.best_config
         k = cfg.kwargs
         _redo[(triton.cdiv(M, k["BM"]) * triton.cdiv(N, k["BN"]),)](
-            *args, BM=k["BM"], BN=k["BN"], BK=k["BK"], G=k["G"], num_warps=cfg.num_warps)
+            *args, I64=i64, BM=k["BM"], BN=k["BN"], BK=k["BK"], G=k["G"], num_warps=cfg.num_warps)
     return c

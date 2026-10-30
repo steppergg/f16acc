@@ -39,6 +39,23 @@ class Kernel(unittest.TestCase):
         self.assertLess(ours, 3 * fp32)      # measured 4.8e-4 vs 3.6e-4
         self.assertLess(ours * 5, plain)     # measured 4.8e-4 vs 8.8e-3
 
+    def test_bad_inputs_raise_instead_of_reading_out_of_bounds(self):
+        a = torch.randn(256, 64, device="cuda").half()
+        for bad in (torch.randn(32, 64, device="cuda").half(), torch.randn(64, 64, device="cuda"),
+                    torch.randn(64, 64).half()):
+            with self.assertRaises(ValueError):
+                f16acc.mm(a, bad)
+
+    @unittest.skipUnless(CUDA and torch.cuda.mem_get_info()[0] > 6 * 2 ** 30, "needs about 5 GB free VRAM")
+    def test_output_past_2_31_elements_is_addressed_correctly(self):
+        # 14200 x 151936 output: row offsets pass 2**31, which wrapped (out-of-bounds writes) with 32-bit indexing
+        x = torch.randn(14200, 1536, device="cuda").half() * 0.1
+        w = torch.randn(151936, 1536, device="cuda").half() * 0.1
+        c = f16acc.mm(x, w.t())
+        self.assertLess(rel(c[-4:], (x[-4:] @ w.t()).double()), 1e-2)
+        del c, x, w
+        torch.cuda.empty_cache()
+
     def test_transposed_weight_view(self):
         x = torch.randn(256, 384, device="cuda").half()
         w = torch.randn(640, 384, device="cuda").half()

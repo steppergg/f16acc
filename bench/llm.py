@@ -22,7 +22,7 @@ import transformers.integrations.sdpa_attention as sdpa  # noqa: E402
 sdpa.use_gqa_in_sdpa = lambda *a, **k: False
 
 MODEL = "Qwen/Qwen2.5-1.5B"
-TEXT = r"C:\Python314\LICENSE.txt"
+TEXT = os.path.join(sys.base_prefix, "LICENSE.txt")  # Python's own license text: same on every install of a version
 
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 tok = AutoTokenizer.from_pretrained(MODEL)

@@ -12,7 +12,10 @@ from pathlib import Path
 import torch
 
 SYSTEM32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-SMI = next((str(p) for p in (SYSTEM32 / "nvidia-smi.exe", Path("/usr/bin/nvidia-smi")) if p.is_file()), "nvidia-smi")
+# full path only: a bare "nvidia-smi" is looked up in the current folder first on Windows
+SMI = next((str(p) for p in (SYSTEM32 / "nvidia-smi.exe",
+                             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe",
+                             Path("/usr/bin/nvidia-smi")) if p.is_file()), None)
 LOAD_S = 1.5
 
 
@@ -33,6 +36,8 @@ def timed(op, n, warmup=10, iters=30):
 def sample_under_load(op):
     """(SM MHz, watts, power-capped) read by nvidia-smi while op() keeps running.
     The driver refreshes these about once a second, so load for LOAD_S first."""
+    if SMI is None:
+        raise FileNotFoundError("nvidia-smi not found in System32, NVSMI or /usr/bin")
     end = time.perf_counter() + LOAD_S
     while time.perf_counter() < end:
         op(); torch.cuda.synchronize()
