@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "f16acc"
+version = "0.1.0"
+description = "Near-FP32-accurate FP16 GEMM at full tensor rate on stock GeForce cards (Triton)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "torch",
+    "triton; sys_platform != 'win32'",
+    "triton-windows; sys_platform == 'win32'",
+]
+
+[tool.setuptools]
+packages = ["f16acc"]
